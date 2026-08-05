@@ -38,7 +38,7 @@ Therefore, the AWS Load Balancer Controller places both host rules on one ALB.
 
 ## Deploy with Jenkins
 
-Create a Pipeline job that uses the repository's `Jenkinsfile`. The Jenkins agent
+Create an infrastructure Pipeline job that uses the repository's `Jenkinsfile`. The Jenkins agent
 must have Terraform, AWS CLI, and AWS credentials (or an instance/task role) with
 the required permissions. Build parameters are:
 
@@ -53,6 +53,60 @@ interactive Jenkins confirmation.
 
 State is local to the Jenkins workspace by default. Configure an S3 backend with
 state locking before using this pipeline for shared or production infrastructure.
+
+## Deploy disposable CRUD stacks with Jenkins
+
+Create a second Pipeline job from the same repository and set its script path to
+`Jenkins.deploy`. This job deploys independent todo applications into namespaces
+named `crud-<stack_id>`, where `stack_id` is a randomly generated four-character
+lowercase alphanumeric value.
+
+Each stack contains one Nginx UI, one PostgREST backend, and one PostgreSQL
+database. The UI proxies `/api/` to the namespace-local backend, and only the UI
+is exposed through an Ingress. Every stack joins the existing `shared-ui`
+IngressGroup, so the AWS Load Balancer Controller adds each hostname to the
+shared ALB instead of creating another load balancer.
+
+The Jenkins agent needs AWS CLI, `kubectl`, `curl`, OpenSSL, AWS credentials, and
+permission to access the EKS cluster and manage namespaces and namespaced
+resources. Pipeline parameters are:
+
+- `ACTION`: `deploy` or `delete`
+- `AWS_REGION`: region containing the EKS cluster
+- `CLUSTER_NAME`: EKS cluster name
+- `BASE_DOMAIN`: wildcard domain used for new stacks
+- `STACK_ID`: required only for deletion
+
+Before deploying, configure wildcard DNS for `*.<base_domain>` to resolve to the
+shared ALB. DNS management is intentionally outside this project. For example,
+with `BASE_DOMAIN=preview.example.com`, a generated ID of `a1b2` is available at:
+
+```text
+http://a1b2.preview.example.com
+```
+
+Run the job with `ACTION=deploy`; `STACK_ID` is ignored for deploys. The build
+description and final log contain the generated ID, namespace, URL, and deletion
+instructions. The pipeline waits for all three Deployments and verifies both the
+internal API and public ALB route. A failed deploy automatically removes its
+partially created namespace.
+
+To remove that stack, run the same job with:
+
+```text
+ACTION=delete
+STACK_ID=a1b2
+```
+
+Deletion is allowed only when the namespace has the ownership labels written by
+`Jenkins.deploy`. Deleting the namespace removes its Secret, ConfigMaps,
+Deployments, Services, Ingress, and database data. PostgreSQL uses `emptyDir`, so
+its data is also lost whenever the database pod is replaced; this application is
+for temporary testing only.
+
+Multiple stacks may coexist and separate Jenkins builds may deploy concurrently.
+The practical number is limited by cluster capacity and AWS ALB listener-rule and
+target-group quotas. The demo API is intentionally unauthenticated and HTTP-only.
 
 ## Deploy locally
 
@@ -139,9 +193,14 @@ in `SUBNET_IDS`.
 
 ## Destroy
 
-Delete application Ingress resources before destroying the infrastructure so the controller has time to remove the ALB and target groups:
+Delete all disposable CRUD stacks and the Terraform-managed application Ingress
+resources before destroying the infrastructure so the controller has time to
+remove ALB rules and target groups:
 
 ```bash
+kubectl get namespace -l app.kubernetes.io/part-of=crud-demo
+# Delete each listed stack with Jenkins.deploy ACTION=delete, or after verifying
+# the labels, delete its crud-<stack_id> namespace manually.
 kubectl delete ingress ui -n dev0
 kubectl delete ingress ui -n dev1
 terraform destroy

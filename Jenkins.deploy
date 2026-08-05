@@ -1,0 +1,315 @@
+pipeline {
+  agent any
+
+  options {
+    timestamps()
+  }
+
+  parameters {
+    choice(name: 'ACTION', choices: ['deploy', 'delete'], description: 'Create a new CRUD stack or delete one by stack ID')
+    string(name: 'AWS_REGION', defaultValue: 'us-east-1', description: 'AWS region containing the EKS cluster')
+    string(name: 'CLUSTER_NAME', defaultValue: 'demo-karpenter-alb', description: 'EKS cluster name')
+    string(name: 'BASE_DOMAIN', defaultValue: 'example.com', description: 'Wildcard DNS domain used for deploys, for example preview.example.com')
+    string(name: 'STACK_ID', defaultValue: '', description: 'Four-character stack ID; required only when ACTION=delete')
+  }
+
+  environment {
+    KUBECONFIG = "${WORKSPACE}/.kube/config"
+  }
+
+  stages {
+    stage('Validate parameters') {
+      steps {
+        script {
+          def region = params.AWS_REGION.trim()
+          def clusterName = params.CLUSTER_NAME.trim()
+
+          if (!region) {
+            error('AWS_REGION is required')
+          }
+          if (!(region ==~ /[a-z]{2}(?:-gov)?-[a-z]+-\d/)) {
+            error('AWS_REGION must look like us-east-1')
+          }
+          if (!(clusterName ==~ /[A-Za-z0-9][A-Za-z0-9_-]{0,99}/)) {
+            error('CLUSTER_NAME must contain only letters, numbers, hyphens, and underscores')
+          }
+
+          env.DEPLOY_REGION = region
+          env.DEPLOY_CLUSTER = clusterName
+
+          if (params.ACTION == 'deploy') {
+            def baseDomain = params.BASE_DOMAIN.trim().toLowerCase()
+            if (baseDomain.endsWith('.')) {
+              baseDomain = baseDomain.substring(0, baseDomain.length() - 1)
+            }
+            def dnsLabel = /[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?/
+            def domainLabels = baseDomain.tokenize('.')
+            if (baseDomain.size() > 253 || domainLabels.size() < 2 ||
+                domainLabels.join('.') != baseDomain || !domainLabels.every { it ==~ dnsLabel }) {
+              error('BASE_DOMAIN must be a valid DNS domain containing at least two labels')
+            }
+            env.DEPLOY_BASE_DOMAIN = baseDomain
+          } else {
+            def stackId = params.STACK_ID.trim().toLowerCase()
+            if (!(stackId ==~ /[a-z0-9]{4}/)) {
+              error('STACK_ID must contain exactly four lowercase letters or numbers')
+            }
+            env.STACK_ID = stackId
+            env.NAMESPACE = "crud-${stackId}"
+            currentBuild.description = "delete ${env.NAMESPACE}"
+          }
+        }
+      }
+    }
+
+    stage('Configure kubectl') {
+      steps {
+        sh '''
+          set -eu
+          mkdir -p "$(dirname "$KUBECONFIG")"
+          aws eks update-kubeconfig \
+            --region "$DEPLOY_REGION" \
+            --name "$DEPLOY_CLUSTER" \
+            --kubeconfig "$KUBECONFIG"
+          kubectl version --client
+          kubectl cluster-info
+        '''
+      }
+    }
+
+    stage('Create namespace') {
+      when {
+        expression { params.ACTION == 'deploy' }
+      }
+      steps {
+        script {
+          def created = false
+
+          for (int attempt = 1; attempt <= 20 && !created; attempt++) {
+            def stackId = sh(
+              returnStdout: true,
+              script: "openssl rand -base64 48 | tr -dc 'a-z0-9' | head -c 4"
+            ).trim()
+            if (!(stackId ==~ /[a-z0-9]{4}/)) {
+              error('Unable to generate a four-character stack ID')
+            }
+            def namespace = "crud-${stackId}"
+            def status = sh(
+              returnStatus: true,
+              script: "kubectl create namespace '${namespace}' > .namespace-create.log 2>&1"
+            )
+
+            if (status == 0) {
+              env.STACK_ID = stackId
+              env.NAMESPACE = namespace
+              env.NAMESPACE_CREATED = 'true'
+              created = true
+            } else {
+              def createOutput = readFile('.namespace-create.log')
+              if (!createOutput.contains('AlreadyExists')) {
+                error("Unable to create namespace ${namespace}: ${createOutput.trim()}")
+              }
+              echo "Namespace ${namespace} already exists; generating another stack ID"
+            }
+          }
+
+          if (!created) {
+            error('Unable to allocate a unique stack ID after 20 attempts')
+          }
+
+          env.STACK_HOST = "${env.STACK_ID}.${env.DEPLOY_BASE_DOMAIN}"
+          env.STACK_URL = "http://${env.STACK_HOST}"
+          env.RENDERED_MANIFEST = "${env.WORKSPACE}/.crud-stack-${env.STACK_ID}.yaml"
+          currentBuild.description = "${env.STACK_ID} - ${env.STACK_URL}"
+
+          sh '''
+            set -eu
+            kubectl label namespace "$NAMESPACE" \
+              app.kubernetes.io/part-of=crud-demo \
+              app.kubernetes.io/managed-by=jenkins \
+              "stack-id=$STACK_ID" \
+              --overwrite
+          '''
+        }
+      }
+    }
+
+    stage('Apply application') {
+      when {
+        expression { params.ACTION == 'deploy' }
+      }
+      steps {
+        script {
+          def manifest = readFile('manifests/crud-stack.yaml')
+          if (!manifest.contains('__STACK_HOST__')) {
+            error('The CRUD manifest does not contain the __STACK_HOST__ placeholder')
+          }
+          writeFile(
+            file: env.RENDERED_MANIFEST,
+            text: manifest.replace('__STACK_HOST__', env.STACK_HOST)
+          )
+        }
+
+        withEnv(["DB_PASSWORD=${sh(returnStdout: true, script: 'openssl rand -hex 32').trim()}"]) {
+          sh '''
+            set -eu
+            set +x
+            kubectl -n "$NAMESPACE" create secret generic crud-db \
+              --from-literal="password=$DB_PASSWORD" \
+              --dry-run=client \
+              -o yaml | kubectl apply -f -
+            set -x
+            kubectl -n "$NAMESPACE" apply -f "$RENDERED_MANIFEST"
+          '''
+        }
+      }
+    }
+
+    stage('Wait for application') {
+      when {
+        expression { params.ACTION == 'deploy' }
+      }
+      steps {
+        sh '''
+          set -eu
+          kubectl -n "$NAMESPACE" rollout status deployment/database --timeout=5m
+          kubectl -n "$NAMESPACE" rollout status deployment/backend --timeout=5m
+          kubectl -n "$NAMESPACE" rollout status deployment/ui --timeout=5m
+        '''
+      }
+    }
+
+    stage('Smoke test') {
+      when {
+        expression { params.ACTION == 'deploy' }
+      }
+      steps {
+        sh '''
+          set -eu
+
+          internal_response="$(kubectl -n "$NAMESPACE" exec deployment/ui -- \
+            wget -qO- http://backend:3000/todos)"
+          test "$internal_response" = '[]'
+
+          proxy_response="$(kubectl -n "$NAMESPACE" exec deployment/ui -- \
+            wget -qO- http://127.0.0.1:8080/api/todos)"
+          test "$proxy_response" = '[]'
+
+          ingress_hostname=''
+          attempt=1
+          while [ "$attempt" -le 60 ]; do
+            ingress_hostname="$(kubectl -n "$NAMESPACE" get ingress ui \
+              -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)"
+            if [ -n "$ingress_hostname" ]; then
+              break
+            fi
+            sleep 10
+            attempt=$((attempt + 1))
+          done
+          test -n "$ingress_hostname"
+
+          reachable='false'
+          attempt=1
+          while [ "$attempt" -le 60 ]; do
+            if curl --fail --silent --show-error --max-time 15 "$STACK_URL/" >/dev/null && \
+               curl --fail --silent --show-error --max-time 15 "$STACK_URL/api/todos" | grep -qx '\[\]'; then
+              reachable='true'
+              break
+            fi
+            sleep 10
+            attempt=$((attempt + 1))
+          done
+
+          if [ "$reachable" != 'true' ]; then
+            echo "The stack did not become reachable at $STACK_URL within 10 minutes" >&2
+            exit 1
+          fi
+
+          smoke_title="pipeline-smoke-$STACK_ID"
+          curl --fail --silent --show-error \
+            -X POST \
+            -H 'Content-Type: application/json' \
+            -H 'Prefer: return=minimal' \
+            --data "{\"title\":\"$smoke_title\"}" \
+            "$STACK_URL/api/todos"
+
+          curl --fail --silent --show-error \
+            "$STACK_URL/api/todos?select=title&title=eq.$smoke_title" | \
+            grep -Fq "\"title\":\"$smoke_title\""
+
+          curl --fail --silent --show-error \
+            -X PATCH \
+            -H 'Content-Type: application/json' \
+            -H 'Prefer: return=minimal' \
+            --data '{"completed":true}' \
+            "$STACK_URL/api/todos?title=eq.$smoke_title"
+
+          curl --fail --silent --show-error \
+            "$STACK_URL/api/todos?select=completed&title=eq.$smoke_title" | \
+            grep -Fq '"completed":true'
+
+          curl --fail --silent --show-error \
+            -X DELETE \
+            "$STACK_URL/api/todos?title=eq.$smoke_title"
+
+          curl --fail --silent --show-error \
+            "$STACK_URL/api/todos?title=eq.$smoke_title" | grep -qx '\[\]'
+        '''
+      }
+    }
+
+    stage('Delete stack') {
+      when {
+        expression { params.ACTION == 'delete' }
+      }
+      steps {
+        sh '''
+          set -eu
+
+          part_of="$(kubectl get namespace "$NAMESPACE" \
+            -o go-template='{{ index .metadata.labels "app.kubernetes.io/part-of" }}')"
+          managed_by="$(kubectl get namespace "$NAMESPACE" \
+            -o go-template='{{ index .metadata.labels "app.kubernetes.io/managed-by" }}')"
+          namespace_stack_id="$(kubectl get namespace "$NAMESPACE" \
+            -o go-template='{{ index .metadata.labels "stack-id" }}')"
+
+          if [ "$part_of" != 'crud-demo' ] || \
+             [ "$managed_by" != 'jenkins' ] || \
+             [ "$namespace_stack_id" != "$STACK_ID" ]; then
+            echo "Refusing to delete $NAMESPACE because its ownership labels do not match" >&2
+            exit 1
+          fi
+
+          kubectl delete namespace "$NAMESPACE" --wait=true --timeout=5m
+        '''
+      }
+    }
+  }
+
+  post {
+    success {
+      script {
+        if (params.ACTION == 'deploy') {
+          echo "Deployed stack ${env.STACK_ID} in namespace ${env.NAMESPACE}"
+          echo "URL: ${env.STACK_URL}"
+          echo "Delete with ACTION=delete and STACK_ID=${env.STACK_ID}"
+        } else {
+          echo "Deleted stack ${env.STACK_ID} and namespace ${env.NAMESPACE}"
+        }
+      }
+    }
+
+    failure {
+      script {
+        if (params.ACTION == 'deploy' && env.NAMESPACE_CREATED == 'true' && env.NAMESPACE?.trim()) {
+          echo "Deployment failed; deleting partial namespace ${env.NAMESPACE}"
+          sh "kubectl delete namespace '${env.NAMESPACE}' --ignore-not-found --wait=false || true"
+        }
+      }
+    }
+
+    always {
+      sh 'rm -f .namespace-create.log .crud-stack-*.yaml'
+    }
+  }
+}
