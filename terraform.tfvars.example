@@ -1,0 +1,11 @@
+aws_region         = "us-east-1"
+cluster_name       = "demo-karpenter-alb"
+kubernetes_version = "1.33"
+dev0_host          = "dev0.example.com"
+dev1_host          = "dev1.example.com"
+
+tags = {
+  Environment = "dev"
+  Project     = "eks-karpenter-alb"
+  ManagedBy   = "Terraform"
+}
