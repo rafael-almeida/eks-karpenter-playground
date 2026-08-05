@@ -16,10 +16,27 @@ variable "kubernetes_version" {
   default     = "1.33"
 }
 
-variable "vpc_cidr" {
-  description = "CIDR block for the VPC."
+variable "vpc_id" {
+  description = "ID of the existing VPC in which to create the EKS cluster."
   type        = string
-  default     = "10.20.0.0/16"
+
+  validation {
+    condition     = can(regex("^vpc-[0-9a-f]+$", var.vpc_id))
+    error_message = "vpc_id must be a valid VPC ID, for example vpc-0123456789abcdef0."
+  }
+}
+
+variable "subnet_ids" {
+  description = "Existing subnet IDs used by EKS and Karpenter. Use private subnets in at least two availability zones."
+  type        = list(string)
+
+  validation {
+    condition = (
+      length(var.subnet_ids) >= 2 &&
+      alltrue([for id in var.subnet_ids : can(regex("^subnet-[0-9a-f]+$", id))])
+    )
+    error_message = "subnet_ids must contain at least two valid subnet IDs."
+  }
 }
 
 variable "dev0_host" {

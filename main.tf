@@ -1,35 +1,7 @@
 locals {
-  azs = slice(data.aws_availability_zones.available.names, 0, 3)
-
   common_tags = merge(var.tags, {
     "karpenter.sh/discovery" = var.cluster_name
   })
-}
-
-module "vpc" {
-  source  = "terraform-aws-modules/vpc/aws"
-  version = "~> 6.0"
-
-  name = var.cluster_name
-  cidr = var.vpc_cidr
-
-  azs             = local.azs
-  private_subnets = [for index, _ in local.azs : cidrsubnet(var.vpc_cidr, 4, index)]
-  public_subnets  = [for index, _ in local.azs : cidrsubnet(var.vpc_cidr, 4, index + 8)]
-
-  enable_nat_gateway = true
-  single_nat_gateway = true
-
-  public_subnet_tags = {
-    "kubernetes.io/role/elb" = 1
-  }
-
-  private_subnet_tags = {
-    "kubernetes.io/role/internal-elb" = 1
-    "karpenter.sh/discovery"          = var.cluster_name
-  }
-
-  tags = local.common_tags
 }
 
 module "eks" {
@@ -44,7 +16,7 @@ module "eks" {
   enable_irsa                              = true
 
   addons = {
-    coredns = {}
+    coredns    = {}
     kube-proxy = {}
     vpc-cni = {
       before_compute = true
@@ -54,8 +26,8 @@ module "eks" {
     }
   }
 
-  vpc_id     = module.vpc.vpc_id
-  subnet_ids = module.vpc.private_subnets
+  vpc_id     = var.vpc_id
+  subnet_ids = var.subnet_ids
 
   # Karpenter and the AWS Load Balancer Controller must run somewhere before
   # Karpenter-created capacity exists. Keep this group small and stable.

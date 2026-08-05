@@ -1,6 +1,8 @@
 aws_region         = "us-east-1"
 cluster_name       = "demo-karpenter-alb"
 kubernetes_version = "1.33"
+vpc_id             = "vpc-0123456789abcdef0"
+subnet_ids         = ["subnet-0123456789abcdef0", "subnet-0123456789abcdef1"]
 dev0_host          = "dev0.example.com"
 dev1_host          = "dev1.example.com"
 

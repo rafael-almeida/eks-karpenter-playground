@@ -7,8 +7,7 @@ spec:
     - alias: al2023@latest
   role: ${node_role}
   subnetSelectorTerms:
-    - tags:
-        karpenter.sh/discovery: ${cluster_name}
+    ${indent(4, subnet_selector_terms)}
   securityGroupSelectorTerms:
     - tags:
         karpenter.sh/discovery: ${cluster_name}

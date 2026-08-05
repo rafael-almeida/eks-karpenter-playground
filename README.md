@@ -1,8 +1,7 @@
 # EKS + Karpenter + shared ALB routing
 
-This Terraform project creates:
+This Terraform project uses an existing VPC and subnets to create:
 
-- A three-AZ VPC with public and private subnets
 - An EKS cluster
 - A small managed node group for system controllers
 - Karpenter IAM resources, interruption SQS queue, EventBridge rules, and Helm release
@@ -30,15 +29,36 @@ Therefore, the AWS Load Balancer Controller places both host rules on one ALB.
 
 ## Prerequisites
 
+- An existing VPC and at least two private subnets in different Availability Zones
+- Public subnets tagged `kubernetes.io/role/elb=1` so the controller can discover them for the internet-facing ALB
 - Terraform 1.8+
-- AWS CLI authenticated with permissions to create VPC, EKS, EC2, IAM, SQS, EventBridge, and ELB resources
+- AWS CLI authenticated with permissions to use the supplied VPC and create EKS, EC2, IAM, SQS, EventBridge, and ELB resources
 - `kubectl`
 - Access to the public Terraform Registry and Helm repositories
 
-## Deploy
+## Deploy with Jenkins
+
+Create a Pipeline job that uses the repository's `Jenkinsfile`. The Jenkins agent
+must have Terraform, AWS CLI, and AWS credentials (or an instance/task role) with
+the required permissions. Build parameters are:
+
+- `VPC_ID`: the existing VPC ID
+- `SUBNET_IDS`: comma-separated private subnet IDs spanning at least two Availability Zones
+- `AWS_REGION`: the AWS region containing the VPC
+- `ACTION`: `plan`, `apply`, or `destroy`
+
+The pipeline converts `SUBNET_IDS` to Terraform's list format and exports both
+network parameters as `TF_VAR_` environment variables. Destroy requires an
+interactive Jenkins confirmation.
+
+State is local to the Jenkins workspace by default. Configure an S3 backend with
+state locking before using this pipeline for shared or production infrastructure.
+
+## Deploy locally
 
 ```bash
 cp terraform.tfvars.example terraform.tfvars
+# Set vpc_id and subnet_ids in terraform.tfvars.
 terraform init
 terraform plan
 terraform apply
@@ -95,12 +115,19 @@ Karpenter should create EC2 capacity after pods become unschedulable.
 
 Terraform configures AWS infrastructure, Helm charts, and Kubernetes objects in one root module. Depending on network conditions and provider behavior, the first apply can encounter a temporary Kubernetes API connection error while EKS is becoming ready. Re-running `terraform apply` is safe. For stricter production workflows, split this into two states:
 
-1. VPC, EKS, IAM, SQS, and EventBridge
+1. EKS, IAM, SQS, and EventBridge
 2. Helm releases and Kubernetes resources
+
+## Existing network requirements
+
+The supplied subnets are used for the EKS managed node group and Karpenter nodes,
+so they should normally be private subnets with outbound access through NAT or
+the required VPC endpoints. The internet-facing ALB discovers public subnets by
+their `kubernetes.io/role/elb=1` tag; those public subnets do not need to be passed
+in `SUBNET_IDS`.
 
 ## Production changes to consider
 
-- Replace the single NAT gateway with one NAT gateway per AZ
 - Restrict the public EKS endpoint or use private access through a CI runner in the VPC
 - Add Route 53 records and ACM-managed HTTPS
 - Apply AWS WAF, access logs, deletion protection, and ALB security-group restrictions

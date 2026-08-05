@@ -96,13 +96,13 @@ resource "kubernetes_ingress_v1" "ui" {
     namespace = each.key
 
     annotations = {
-      "alb.ingress.kubernetes.io/group.name"         = "shared-ui"
-      "alb.ingress.kubernetes.io/group.order"        = each.key == "dev0" ? "10" : "20"
-      "alb.ingress.kubernetes.io/scheme"             = "internet-facing"
-      "alb.ingress.kubernetes.io/target-type"        = "ip"
-      "alb.ingress.kubernetes.io/listen-ports"       = jsonencode([{ HTTP = 80 }])
-      "alb.ingress.kubernetes.io/healthcheck-path"   = "/"
-      "alb.ingress.kubernetes.io/success-codes"      = "200"
+      "alb.ingress.kubernetes.io/group.name"       = "shared-ui"
+      "alb.ingress.kubernetes.io/group.order"      = each.key == "dev0" ? "10" : "20"
+      "alb.ingress.kubernetes.io/scheme"           = "internet-facing"
+      "alb.ingress.kubernetes.io/target-type"      = "ip"
+      "alb.ingress.kubernetes.io/listen-ports"     = jsonencode([{ HTTP = 80 }])
+      "alb.ingress.kubernetes.io/healthcheck-path" = "/"
+      "alb.ingress.kubernetes.io/success-codes"    = "200"
     }
   }
 

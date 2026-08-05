@@ -2,6 +2,9 @@ resource "kubernetes_manifest" "ec2_node_class" {
   manifest = yamldecode(templatefile("${path.module}/manifests/ec2-node-class.yaml.tftpl", {
     cluster_name = module.eks.cluster_name
     node_role    = module.karpenter.node_iam_role_name
+    subnet_selector_terms = yamlencode([
+      for subnet_id in var.subnet_ids : { id = subnet_id }
+    ])
   }))
 
   depends_on = [helm_release.karpenter]

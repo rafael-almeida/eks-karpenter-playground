@@ -68,7 +68,7 @@ resource "helm_release" "aws_load_balancer_controller" {
   values = [yamlencode({
     clusterName = module.eks.cluster_name
     region      = var.aws_region
-    vpcId       = module.vpc.vpc_id
+    vpcId       = var.vpc_id
     serviceAccount = {
       create = false
       name   = kubernetes_service_account_v1.aws_load_balancer_controller.metadata[0].name
